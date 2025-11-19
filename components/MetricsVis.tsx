@@ -1,28 +1,47 @@
 import React, { useEffect, useRef } from 'react';
 import * as d3 from 'd3';
-import { WorkflowStep } from '../types';
+import { WorkflowStep, StepStatus } from '../types';
 
 interface Props {
   steps: WorkflowStep[];
 }
 
+/**
+ * MetricsVis Component - Displays performance metrics as a D3 bar chart
+ * Shows latency in milliseconds for each completed workflow step
+ */
 const MetricsVis: React.FC<Props> = ({ steps }) => {
   const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!svgRef.current || steps.length === 0) return;
+    if (!svgRef.current || !containerRef.current) return;
 
-    const completedSteps = steps.filter(s => s.status === 'COMPLETED' && s.latency);
-    if (completedSteps.length === 0) return;
+    // Use enum for type safety
+    const completedSteps = steps.filter(s => s.status === StepStatus.COMPLETED && s.latency);
 
-    const containerWidth = svgRef.current.parentElement?.clientWidth || 300;
+    if (completedSteps.length === 0) {
+      // Clear chart if no data
+      d3.select(svgRef.current).selectAll("*").remove();
+      return;
+    }
+
+    const containerWidth = containerRef.current.clientWidth || 300;
     const height = 150;
-    const margin = { top: 20, right: 20, bottom: 30, left: 40 };
+    const margin = { top: 20, right: 20, bottom: 30, left: 45 };
 
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
 
-    const width = containerWidth - margin.left - margin.right;
+    // More efficient update: only clear if necessary
+    const existingGroups = svg.select('g.chart-group');
+    if (existingGroups.empty()) {
+      svg.selectAll("*").remove();
+    } else {
+      // Clear only chart elements, not structure
+      existingGroups.selectAll("*").remove();
+    }
+
+    const width = Math.max(containerWidth - margin.left - margin.right, 100);
 
     const x = d3.scaleBand()
       .range([0, width])
@@ -33,8 +52,13 @@ const MetricsVis: React.FC<Props> = ({ steps }) => {
       .range([height, 0])
       .domain([0, d3.max(completedSteps, d => d.latency || 0) || 1000]);
 
-    const g = svg.append("g")
-      .attr("transform", `translate(${margin.left},${margin.top})`);
+    // Reuse or create chart group
+    let g = svg.select<SVGGElement>('g.chart-group');
+    if (g.empty()) {
+      g = svg.append<SVGGElement>("g")
+        .attr("class", "chart-group")
+        .attr("transform", `translate(${margin.left},${margin.top})`);
+    }
 
     // Bars
     g.selectAll(".bar")
@@ -76,11 +100,22 @@ const MetricsVis: React.FC<Props> = ({ steps }) => {
   return (
     <div className="w-full bg-slate-900/50 border border-slate-800 rounded-lg p-4 mt-4">
       <h3 className="text-xs font-semibold uppercase text-slate-500 mb-2">Performance Metrics</h3>
-      <div className="w-full h-[160px]">
+      <div ref={containerRef} className="w-full h-[160px]">
          <svg ref={svgRef} width="100%" height="100%"></svg>
       </div>
     </div>
   );
 };
 
-export default MetricsVis;
+// Memoize to prevent unnecessary re-renders
+export default React.memo(MetricsVis, (prevProps, nextProps) => {
+  // Only re-render if completed steps or their latencies changed
+  const prevCompleted = prevProps.steps.filter(s => s.status === StepStatus.COMPLETED && s.latency);
+  const nextCompleted = nextProps.steps.filter(s => s.status === StepStatus.COMPLETED && s.latency);
+
+  if (prevCompleted.length !== nextCompleted.length) return false;
+
+  return prevCompleted.every((step, i) =>
+    step.latency === nextCompleted[i].latency && step.id === nextCompleted[i].id
+  );
+});

@@ -1,17 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
-  Play, 
-  Pause, 
-  RotateCcw, 
-  Settings, 
-  Plus, 
-  Trash2, 
-  CheckCircle, 
-  AlertCircle, 
-  Terminal, 
-  Cpu,
-  Save,
-  SkipForward
+import {
+  Play,
+  RotateCcw,
+  Plus,
+  CheckCircle,
+  AlertCircle,
+  Terminal,
+  Cpu
 } from 'lucide-react';
 import { 
   WorkflowState, 
@@ -25,16 +20,27 @@ import { INITIAL_STEPS, MODEL_INFO, SYSTEM_INSTRUCTION } from './constants';
 import { llmService } from './services/llmService';
 import MetricsVis from './components/MetricsVis';
 
-// Helper for persistence
+/**
+ * Helper for persistence - loads workflow state from localStorage
+ * Falls back to default state if localStorage is unavailable or corrupted
+ */
 const loadState = (): WorkflowState => {
-  const saved = localStorage.getItem('nexus_flow_state_v1');
-  if (saved) {
-    try {
-      return JSON.parse(saved);
-    } catch (e) {
-      console.error("Failed to parse saved state", e);
+  try {
+    const saved = localStorage.getItem('nexus_flow_state_v1');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Validate that parsed state has required properties
+      if (parsed.steps && Array.isArray(parsed.steps) && parsed.selectedModel) {
+        return parsed;
+      }
+      console.warn("Saved state is invalid, using default state");
     }
+  } catch (e) {
+    console.error("Failed to load saved state from localStorage:", e);
+    // Optionally show user notification that state was reset
   }
+
+  // Default state
   return {
     steps: INITIAL_STEPS,
     currentStepIndex: 0,
@@ -49,9 +55,14 @@ const App: React.FC = () => {
   const [state, setState] = useState<WorkflowState>(loadState);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Persistence Effect
+  // Persistence Effect with error handling
   useEffect(() => {
-    localStorage.setItem('nexus_flow_state_v1', JSON.stringify(state));
+    try {
+      localStorage.setItem('nexus_flow_state_v1', JSON.stringify(state));
+    } catch (e) {
+      console.error("Failed to save state to localStorage:", e);
+      // Could show user notification about save failure
+    }
   }, [state]);
 
   // Auto-scroll logs
@@ -61,50 +72,91 @@ const App: React.FC = () => {
     }
   }, [state.history]);
 
-  const addLog = (message: string, level: LogEntry['level'] = 'info', details?: string) => {
-    setState(prev => ({
-      ...prev,
-      history: [
+  /**
+   * Add a log entry to the system log history
+   * Automatically limits history to last 500 entries to prevent memory leak
+   * @param message Log message text
+   * @param level Log severity level (info, success, warn, error)
+   * @param details Optional additional details
+   */
+  const addLog = useCallback((message: string, level: LogEntry['level'] = 'info', details?: string) => {
+    setState(prev => {
+      const newHistory = [
         ...prev.history,
         { id: Date.now().toString(), timestamp: Date.now(), level, message, details }
-      ]
-    }));
-  };
+      ];
+      return {
+        ...prev,
+        history: newHistory.slice(-500)
+      };
+    });
+  }, []);
 
-  const updateStep = (index: number, updates: Partial<WorkflowStep>) => {
+  /**
+   * Update a specific workflow step with partial updates
+   * @param index Step index to update
+   * @param updates Partial step properties to merge
+   */
+  const updateStep = useCallback((index: number, updates: Partial<WorkflowStep>) => {
     setState(prev => {
       const newSteps = [...prev.steps];
       newSteps[index] = { ...newSteps[index], ...updates };
       return { ...prev, steps: newSteps };
     });
-  };
+  }, []);
 
+  /**
+   * Reset the entire workflow to initial state
+   * Preserves log history but clears all step results and progress
+   */
   const handleReset = () => {
     if (window.confirm("Reset workflow? History will be preserved in logs.")) {
        setState(prev => ({
         ...prev,
         currentStepIndex: 0,
-        steps: prev.steps.map(s => ({ ...s, status: StepStatus.PENDING, result: undefined, error: undefined, latency: undefined })),
+        steps: prev.steps.map(s => ({
+          ...s,
+          status: StepStatus.PENDING,
+          result: undefined,
+          error: undefined,
+          latency: undefined,
+          feedback: undefined
+        })),
         isProcessing: false,
       }));
       addLog("Workflow reset initiated.", 'warn');
     }
   };
 
+  /**
+   * Execute a workflow step by calling the selected LLM provider
+   * Handles context gathering, feedback integration, timeout, and error handling
+   * @param index Index of the step to execute
+   */
   const executeStep = useCallback(async (index: number) => {
-    const step = state.steps[index];
+    // Use functional state update to avoid stale closure
+    setState(prev => {
+      const step = prev.steps[index];
+      if (!step) return prev;
+
+      // Mark as running
+      const newSteps = [...prev.steps];
+      newSteps[index] = { ...step, status: StepStatus.RUNNING, modelUsed: prev.selectedModel };
+
+      return { ...prev, steps: newSteps, isProcessing: true };
+    });
+
+    // Get current state snapshot for async work
+    const currentState = state;
+    const step = currentState.steps[index];
     if (!step) return;
 
-    // Start
     addLog(`Starting Step ${index + 1}: ${step.title}`, 'info');
-    updateStep(index, { status: StepStatus.RUNNING, modelUsed: state.selectedModel });
-    setState(prev => ({ ...prev, isProcessing: true }));
-
     const startTime = Date.now();
 
     try {
-      // Gather Context
-      const previousContext = state.steps
+      // Gather Context from current state snapshot
+      const previousContext = currentState.steps
         .slice(0, index)
         .filter(s => s.status === StepStatus.COMPLETED && s.result)
         .map(s => `[Step: ${s.title}]\nResult: ${s.result}`)
@@ -113,58 +165,63 @@ const App: React.FC = () => {
       // Add feedback if exists (Human in the loop adjustment)
       let finalPrompt = step.prompt;
       if (step.feedback) {
-        finalPrompt += `\n\nIMPORTANT USER FEEDBACK: ${step.feedback}`;
+        // Validate and sanitize feedback (max 2000 chars)
+        const sanitizedFeedback = step.feedback.trim().slice(0, 2000);
+        finalPrompt += `\n\nIMPORTANT USER FEEDBACK: ${sanitizedFeedback}`;
         addLog(`Applied user feedback to prompt`, 'info');
       }
 
-      // Call Service
-      const result = await llmService.executeStep(state.selectedModel, finalPrompt, SYSTEM_INSTRUCTION, previousContext);
+      // Call Service with timeout
+      const result = await llmService.executeStep(
+        currentState.selectedModel,
+        finalPrompt,
+        SYSTEM_INSTRUCTION,
+        previousContext
+      );
 
       const latency = Date.now() - startTime;
-      updateStep(index, { 
+      updateStep(index, {
         status: StepStatus.PAUSED, // Pause for feedback by default as per requirements
-        result, 
-        latency 
+        result,
+        latency
       });
       addLog(`Step ${index + 1} execution successful. Latency: ${latency}ms`, 'success');
-      
-      // If mode is 'all' or 'batch', we might want to continue, 
-      // BUT requirement says: "After each batch or step, the AI pauses and awaits user feedback".
-      // So we effectively PAUSE here regardless, unless user hits "Approve & Continue".
 
-    } catch (error: any) {
-      updateStep(index, { status: StepStatus.ERROR, error: error.message });
-      addLog(`Error in Step ${index + 1}: ${error.message}`, 'error');
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      updateStep(index, { status: StepStatus.ERROR, error: errorMessage });
+      addLog(`Error in Step ${index + 1}: ${errorMessage}`, 'error', error instanceof Error ? error.stack : undefined);
     } finally {
       setState(prev => ({ ...prev, isProcessing: false }));
     }
-  }, [state.steps, state.selectedModel]);
+  }, [state]);
 
-  const handleContinue = () => {
-    // Mark current step as strictly COMPLETED and move next
+  /**
+   * Approve current step and continue to the next step in the workflow
+   * Marks the current step as COMPLETED and advances the workflow index
+   */
+  const handleContinue = useCallback(() => {
     updateStep(state.currentStepIndex, { status: StepStatus.COMPLETED });
-    
+
     const nextIndex = state.currentStepIndex + 1;
     if (nextIndex < state.steps.length) {
       setState(prev => ({ ...prev, currentStepIndex: nextIndex }));
-      
-      // Logic for auto-run if batch/all mode was selected?
-      // Requirement emphasizes pausing. We'll rely on user hitting "Run" again or we can auto-trigger if we implement a specific 'Auto-Continue' toggle.
-      // For safety/usability in this specific request ("pauses and awaits user feedback"), we stop.
-      if (state.executionMode !== 'step') {
-          // If we were in batch mode, and just finished a step, we might want to auto-trigger ONLY if approved.
-          // We'll leave it as manual trigger for the next step for safety.
-          addLog("Ready for next step. Review results above.", 'info');
-      }
+      addLog(`Advanced to Step ${nextIndex + 1}. Ready to execute.`, 'info');
     } else {
-      addLog("Workflow successfully finished!", 'success');
+      addLog("Workflow successfully completed! All steps finished.", 'success');
     }
-  };
+  }, [state.currentStepIndex, updateStep, addLog]);
 
-  const handleRunClick = () => {
-    if (state.currentStepIndex >= state.steps.length) return;
+  /**
+   * Trigger execution of the current active step
+   */
+  const handleRunClick = useCallback(() => {
+    if (state.currentStepIndex >= state.steps.length) {
+      addLog("All steps have been completed. Reset workflow to start over.", 'warn');
+      return;
+    }
     executeStep(state.currentStepIndex);
-  };
+  }, [state.currentStepIndex, state.steps.length, executeStep, addLog]);
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-slate-950 text-slate-200 font-sans">
